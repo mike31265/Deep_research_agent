@@ -125,8 +125,57 @@ Return ONLY a numbered list of questions.
 # ---------------------------------------------------------
 
 def research_subquestions(subquestions, results_per_query=3):
+    """
+    Researches each sub-question and keeps a single, shared source
+    registry across ALL sub-questions. This means citation numbers
+    like [1], [2] stay consistent everywhere -- in each sub-answer
+    AND in the final synthesized report -- instead of each
+    sub-question restarting its own [1], [2], ...
+    """
 
     results = []
+
+    # Shared across every sub-question:
+    # url -> global source index (1-based)
+    url_to_index = {}
+    # ordered list of {"index": n, "title": ..., "uri": ...}
+    source_registry = []
+
+    def register_sources(hits):
+        """Assign/reuse a global index for each hit, return them
+        annotated with their global index."""
+        annotated = []
+
+        for h in hits:
+            uri = h.get("href", "")
+            title = h.get("title", "") or uri or "Source"
+
+            if not uri:
+                continue
+
+            if uri not in url_to_index:
+                idx = len(source_registry) + 1
+                url_to_index[uri] = idx
+                source_registry.append(
+                    {
+                        "index": idx,
+                        "title": title,
+                        "uri": uri
+                    }
+                )
+            else:
+                idx = url_to_index[uri]
+
+            annotated.append(
+                {
+                    "index": idx,
+                    "title": title,
+                    "uri": uri,
+                    "body": h.get("body", "")
+                }
+            )
+
+        return annotated
 
     for i, q in enumerate(subquestions, 1):
 
@@ -139,13 +188,15 @@ def research_subquestions(subquestions, results_per_query=3):
             max_results=results_per_query
         )
 
-        if hits:
+        annotated_hits = register_sources(hits)
+
+        if annotated_hits:
 
             context = "\n\n".join(
-                f"Source {j + 1}: {h.get('title', '')}\n"
-                f"URL: {h.get('href', '')}\n"
-                f"Snippet: {h.get('body', '')[:700]}"
-                for j, h in enumerate(hits)
+                f"Source [{h['index']}]: {h['title']}\n"
+                f"URL: {h['uri']}\n"
+                f"Snippet: {h['body'][:700]}"
+                for h in annotated_hits
             )
 
             prompt = f"""
@@ -157,8 +208,10 @@ Question:
 Search results:
 {context}
 
-Give a short factual answer with citations
-like [1], [2].
+Give a short factual answer. Cite sources using their
+exact bracket number from the search results above,
+e.g. [{annotated_hits[0]['index']}].
+Do not renumber the sources.
 """
 
         else:
@@ -179,10 +232,11 @@ Question:
 
         sources = [
             {
-                "title": h.get("title", ""),
-                "uri": h.get("href", "")
+                "title": h["title"],
+                "uri": h["uri"],
+                "index": h["index"]
             }
-            for h in hits
+            for h in annotated_hits
         ]
 
         results.append(
@@ -193,19 +247,24 @@ Question:
             }
         )
 
-    return results
+    return results, source_registry
 
 
 # ---------------------------------------------------------
 # Step 3 - Final Report
 # ---------------------------------------------------------
 
-def synthesize_report(topic, results):
+def synthesize_report(topic, results, source_registry):
 
     findings_block = "\n\n".join(
         f"Question: {r['question']}\n"
         f"Answer: {r['answer']}"
         for r in results
+    )
+
+    sources_block = "\n".join(
+        f"[{s['index']}] {s['title']} - {s['uri']}"
+        for s in source_registry
     )
 
     prompt = f"""
@@ -217,12 +276,18 @@ Use ONLY the findings below.
 
 {findings_block}
 
+Available sources (for reference only - use their
+existing bracket numbers, do not renumber them):
+{sources_block}
+
 Include:
 - Short summary
 - Main findings
 - Key takeaways
 
-Keep the report concise and use Markdown.
+Keep any existing [n] citations from the findings intact
+so they still point to the same source. Do not invent new
+citations. Keep the report concise and use Markdown.
 """
 
     return groq_chat(
@@ -248,7 +313,7 @@ def deep_research(topic):
     )
 
     print("Step 2/3 - Researching...")
-    results = research_subquestions(
+    results, source_registry = research_subquestions(
         subquestions,
         results_per_query=3
     )
@@ -256,10 +321,11 @@ def deep_research(topic):
     print("Step 3/3 - Synthesizing...")
     report = synthesize_report(
         topic,
-        results
+        results,
+        source_registry
     )
 
-    return report, results
+    return report, results, source_registry
 
 
 # ---------------------------------------------------------
@@ -273,32 +339,16 @@ def answer_question(question, history):
 
     try:
 
-        report, results = deep_research(
+        report, results, source_registry = deep_research(
             question
         )
 
-        seen = set()
-        source_lines = []
+        if source_registry:
 
-        for result in results:
-
-            for source in result["sources"]:
-
-                uri = source.get("uri", "")
-                title = source.get(
-                    "title",
-                    "Source"
-                )
-
-                if uri and uri not in seen:
-
-                    seen.add(uri)
-
-                    source_lines.append(
-                        f"- [{title}]({uri})"
-                    )
-
-        if source_lines:
+            source_lines = [
+                f"{s['index']}. [{s['title']}]({s['uri']})"
+                for s in source_registry
+            ]
 
             report += (
                 "\n\n---\n"
