@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import gradio as gr
 from ddgs import DDGS
@@ -22,6 +23,49 @@ if not api_key:
 client = Groq(api_key=api_key)
 
 
+def _keywords(text, min_len=4):
+    """Extract lowercase significant words from text for a crude
+    relevance check."""
+    return {
+        w for w in re.findall(r"[a-zA-Z]+", text.lower())
+        if len(w) >= min_len
+    }
+
+
+def filter_relevant_hits(query, hits, min_overlap=1):
+    """
+    Drop hits that share no meaningful keyword overlap with the query.
+
+    This exists because ddgs (DuckDuckGo search) can get rate-limited
+    or soft-blocked on hosted IPs (Render, Railway, etc.) and, instead
+    of failing loudly, sometimes returns unrelated cached/fallback
+    results. Those results look "successful" (no exception) but are
+    completely off-topic, and would otherwise get attached to the
+    final report as bogus sources.
+    """
+
+    query_words = _keywords(query)
+
+    if not query_words:
+        return hits
+
+    relevant = []
+
+    for h in hits:
+        combined = f"{h.get('title', '')} {h.get('body', '')}"
+        hit_words = _keywords(combined)
+
+        if len(query_words & hit_words) >= min_overlap:
+            relevant.append(h)
+        else:
+            print(
+                f"    [filtered irrelevant hit] "
+                f"{h.get('title', '')} | {h.get('href', '')}"
+            )
+
+    return relevant
+
+
 # ---------------------------------------------------------
 # Web Search
 # ---------------------------------------------------------
@@ -30,7 +74,8 @@ def web_search(query, max_results=3):
     """Search the web using DuckDuckGo."""
     try:
         with DDGS() as ddgs:
-            return list(ddgs.text(query, max_results=max_results))
+            hits = list(ddgs.text(query, max_results=max_results))
+            return filter_relevant_hits(query, hits)
     except Exception as e:
         print(f"[search warning] '{query}' failed: {e}")
         return []
@@ -187,6 +232,13 @@ def research_subquestions(subquestions, results_per_query=3):
             q,
             max_results=results_per_query
         )
+
+        # DEBUG: log raw hits so you can see if ddgs is returning
+        # results unrelated to the sub-question itself.
+        for h in hits:
+            print(
+                f"    hit -> {h.get('title', '')} | {h.get('href', '')}"
+            )
 
         annotated_hits = register_sources(hits)
 
